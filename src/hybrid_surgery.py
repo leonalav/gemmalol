@@ -193,6 +193,10 @@ def perform_gdn_surgery(model, target_layers=None):
         # Iterate through hybrid layers
         next_decoder_cache = [] if kwargs.get("use_cache") else None
 
+        # [REPAIR]: Compute RoPE embeddings (required for Gemma 4 layers)
+        # position_ids is passed from the top-level forward
+        position_embeddings = self.rotary_emb(hidden_states, position_ids) if hasattr(self, "rotary_emb") else None
+
         for i, layer in enumerate(self.layers):
             current_ple = per_layer_inputs[:, :, i, :] if per_layer_inputs is not None else None
 
@@ -211,6 +215,7 @@ def perform_gdn_surgery(model, target_layers=None):
                 hidden_states,
                 per_layer_input=current_ple,
                 past_key_values=layer_past,
+                position_embeddings=position_embeddings,
                 **layer_kwargs
             )
 

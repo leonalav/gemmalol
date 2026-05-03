@@ -198,7 +198,7 @@ def perform_gdn_surgery(model, target_layers=None):
         position_embeddings = self.rotary_emb(hidden_states, position_ids) if hasattr(self, "rotary_emb") else None
 
         for i, layer in enumerate(self.layers):
-            current_ple = per_layer_inputs[:, :, i, :] if per_layer_inputs is not None else None
+            current_ple = per_layer_inputs[:, :, i, :] if per_layer_inputs is not None else None #idk
 
             # Index past_key_values for this layer if provided
             layer_past = None

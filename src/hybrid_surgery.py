@@ -178,10 +178,22 @@ def perform_gdn_surgery(model, target_layers=None):
     # --- 3. Forward Pass Patching (Tunneling & Suppression) ---
     
     # A. Patch Gemma4TextModel to support PLE correctly without cross attention
-    def patched_text_model_forward(self, input_ids=None, inputs_embeds=None, **kwargs):
+    def patched_text_model_forward(
+        self,
+        input_ids=None,
+        inputs_embeds=None,
+        attention_mask=None,
+        position_ids=None,
+        **kwargs
+    ):
         # We simplify the forward slightly for the patch, but preserve core logic
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
+
+        if position_ids is None:
+            device = input_ids.device if input_ids is not None else inputs_embeds.device
+            seq_length = input_ids.shape[1] if input_ids is not None else inputs_embeds.shape[1]
+            position_ids = torch.arange(0, seq_length, dtype=torch.long, device=device).unsqueeze(0)
 
         hidden_states = inputs_embeds
         per_layer_inputs = kwargs.get("per_layer_inputs")
@@ -213,6 +225,7 @@ def perform_gdn_surgery(model, target_layers=None):
 
             layer_output = layer(
                 hidden_states,
+                attention_mask=attention_mask,
                 per_layer_input=current_ple,
                 past_key_values=layer_past,
                 position_embeddings=position_embeddings,

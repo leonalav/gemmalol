@@ -103,15 +103,28 @@ def get_fresh_buffer_pretokenized(dataset, start_idx, buffer_size=6000):
 # 4. Dataset Loading & Formatting (Raw SFT Streaming)
 # ==============================================================================
 
-def gemma_format_func(example):
-    """Wraps the homogenized row in the exact Gemma 4 Chat Template."""
-    # Standardize columns for LongAlpaca and others to prompt/response
-    prompt = example.get("instruction", "")
-    if example.get("input", ""):
-        prompt += "\n" + example["input"]
-    response = example.get("output", "")
-    
-    return f"<start_of_turn>user\n{prompt}<end_of_turn>\n<start_of_turn>model\n{response}<end_of_turn>"
+def gemma_format_func(examples):
+    """Wraps a batch of examples in the exact Gemma 4 Chat Template."""
+    output_texts = []
+    # Handle both single examples and batches
+    if isinstance(examples.get("instruction"), list):
+        for i in range(len(examples["instruction"])):
+            prompt = examples["instruction"][i]
+            if examples.get("input") and i < len(examples["input"]):
+                if examples["input"][i]:
+                    prompt += "\n" + examples["input"][i]
+            response = examples["output"][i]
+            text = f"<start_of_turn>user\n{prompt}<end_of_turn>\n<start_of_turn>model\n{response}<end_of_turn>"
+            output_texts.append(text)
+    else:
+        # Fallback for single example
+        prompt = examples.get("instruction", "")
+        if examples.get("input"):
+            prompt += "\n" + examples["input"]
+        response = examples.get("output", "")
+        output_texts.append(f"<start_of_turn>user\n{prompt}<end_of_turn>\n<start_of_turn>model\n{response}<end_of_turn>")
+        
+    return output_texts
 
 def load_stage2_streaming_dataset():
     """Stream the raw text datasets directly."""
@@ -192,8 +205,8 @@ if __name__ == "__main__":
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name="google/gemma-4-E2B-it",
         max_seq_length=8192,
-        dtype=torch.float16,   # T4 GPUs do not support BF16 efficiently; FP16 is mandatory
-        load_in_4bit=False,    # Keep full rank for surgery, but we'll use 8-bit optimizers for memory
+        dtype=torch.bfloat16,  # L40S supports BF16 natively; use it for FLA kernel stability
+        load_in_4bit=False,    
     )
 
     # Phase 1: Execute all architectural replacements upfront
@@ -304,15 +317,15 @@ if __name__ == "__main__":
             per_device_train_batch_size=per_device_bs,
             gradient_accumulation_steps=grad_accum,
             learning_rate=LR_SCHEDULE[layer_idx],
-            fp16=True,   # Enabled FP16 for T4 compatibility
-            bf16=False,  # Disabled BF16 for T4 compatibility
-            optim="paged_adamw_8bit", # 8-bit optimizer reduces optimizer VRAM from 12GB to ~3GB
+            fp16=False,
+            bf16=True,   # Enabled BF16 for L40S
+            optim="adamw_8bit", # L40S has 48GB; standard 8-bit Adam is fine
             logging_steps=10,
             remove_unused_columns=True,
             save_strategy="no",  # We save manually after each phase
             max_seq_length=8192,
             packing=True,
-            gradient_checkpointing=True, # Enable gradient checkpointing for memory efficiency
+            gradient_checkpointing=True,
             # DDP settings
             local_rank=local_rank,
             ddp_find_unused_parameters=False,

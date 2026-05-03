@@ -29,10 +29,11 @@ from transformers.models.gemma4.modeling_gemma4 import (
     BaseModelOutputWithPast
 )
 
-def perform_gdn_surgery(model):
+def perform_gdn_surgery(model, target_layers=None):
     """
     Mutates a multimodal Gemma 4 model (e.g. Gemma4ForConditionalGeneration) 
-    into a GDN hybrid in-place.
+    into a GDN hybrid in-place. If target_layers is provided, only those layers 
+    will be mutated.
     """
     # 1. Target the text backbone
     # Potential structures:
@@ -69,18 +70,17 @@ def perform_gdn_surgery(model):
     config = text_model.config
     
     # 2. Layer-by-layer replacement (Optimized for Memory)
-    print(f"Surgically replacing {len(text_model.layers)} layers...")
-    for i in tqdm(range(len(text_model.layers)), desc="Gemma->GDN Surgery"):
+    layers_to_replace = target_layers if target_layers is not None else range(len(text_model.layers))
+    print(f"Surgically replacing {len(layers_to_replace)} layers...")
+    for i in tqdm(layers_to_replace, desc="Gemma->GDN Surgery"):
         # Access old layer and create new layer
         old_layer = text_model.layers[i]
         new_layer = GemmaDeltaNetLayer(config, layer_idx=i)
         
         # --- Weight Transfer (Decoupled LayerNorms) ---
-        # [ARCH REPAIR]: Use deepcopy & unfreeze to allow norms to adapt to 
-        # the new GDN/Cross-Attention feature distributions.
-        import copy
-        new_layer.input_layernorm = copy.deepcopy(old_layer.input_layernorm).requires_grad_(True)
-        new_layer.post_attention_layernorm = copy.deepcopy(old_layer.post_attention_layernorm).requires_grad_(True)
+        # [MEMORY REPAIR]: Replaced deepcopy with direct assignment to prevent 1.5GB spikes on T4
+        new_layer.input_layernorm = old_layer.input_layernorm
+        new_layer.post_attention_layernorm = old_layer.post_attention_layernorm
         
         # FFN norms stay frozen/pointed (shared with MoE experts)
         new_layer.pre_feedforward_layernorm = old_layer.pre_feedforward_layernorm
@@ -104,10 +104,65 @@ def perform_gdn_surgery(model):
 
         # --- Weight Transfer for QKV & O Projections ---
         # Initialize GDN projections with pretrained Gemma weights (warm start)
-        new_layer.self_attn.q_proj.weight.data.copy_(old_layer.self_attn.q_proj.weight.data)
-        new_layer.self_attn.k_proj.weight.data.copy_(old_layer.self_attn.k_proj.weight.data)
-        new_layer.self_attn.v_proj.weight.data.copy_(old_layer.self_attn.v_proj.weight.data)
-        new_layer.self_attn.o_proj.weight.data.copy_(old_layer.self_attn.o_proj.weight.data)
+        # Handle heterogeneous Gemma 4 layouts (Fused QKV vs Split Q/K/V)
+        old_attn = old_layer.self_attn
+        new_attn = new_layer.self_attn
+
+        if hasattr(old_attn, "qkv_proj"):
+            # Sliding Window / Fused layout
+            w_qkv = old_attn.qkv_proj.weight.data
+            out_features = w_qkv.shape[0]
+            
+            # Dynamically calculate split based on model heads
+            q_dim = new_attn.num_heads * new_attn.head_dim
+            k_dim = new_attn.num_key_value_heads * new_attn.head_dim
+            v_dim = k_dim
+            
+            # [SHAPE REPAIR]: Resize projections if they don't match the checkpoint
+            if q_dim + k_dim + v_dim != out_features:
+                print(f"Warning: Layer {i} QKV mismatch. Resizing new_attn to match {out_features} output features.")
+                total_heads = new_attn.num_heads + 2 * new_attn.num_key_value_heads
+                unit_dim = out_features // total_heads
+                new_attn.head_dim = unit_dim
+                # Re-init projections with correct shapes
+                new_attn.q_proj = nn.Linear(new_attn.q_proj.in_features, new_attn.num_heads * unit_dim, bias=new_attn.q_proj.bias is not None).to(w_qkv.device, w_qkv.dtype)
+                new_attn.k_proj = nn.Linear(new_attn.k_proj.in_features, new_attn.num_key_value_heads * unit_dim, bias=new_attn.k_proj.bias is not None).to(w_qkv.device, w_qkv.dtype)
+                new_attn.v_proj = nn.Linear(new_attn.v_proj.in_features, new_attn.num_key_value_heads * unit_dim, bias=new_attn.v_proj.bias is not None).to(w_qkv.device, w_qkv.dtype)
+                q_dim = new_attn.num_heads * unit_dim
+                k_dim = v_dim = new_attn.num_key_value_heads * unit_dim
+
+            w_q, w_k, w_v = w_qkv.split([q_dim, k_dim, v_dim], dim=0)
+            new_attn.q_proj.weight.data.copy_(w_q)
+            new_attn.k_proj.weight.data.copy_(w_k)
+            new_attn.v_proj.weight.data.copy_(w_v)
+        else:
+            # Global / Split layout
+            if hasattr(old_attn, "q_proj"):
+                old_q = old_attn.q_proj.weight.data
+                if new_attn.q_proj.weight.data.shape != old_q.shape:
+                    print(f"Resizing new_attn.q_proj for layer {i} from {new_attn.q_proj.weight.data.shape} to {old_q.shape}")
+                    new_attn.q_proj = nn.Linear(old_q.shape[1], old_q.shape[0], bias=new_attn.q_proj.bias is not None).to(old_q.device, old_q.dtype)
+                new_attn.q_proj.weight.data.copy_(old_q)
+            
+            if hasattr(old_attn, "k_proj"):
+                old_k = old_attn.k_proj.weight.data
+                if new_attn.k_proj.weight.data.shape != old_k.shape:
+                    new_attn.k_proj = nn.Linear(old_k.shape[1], old_k.shape[0], bias=new_attn.k_proj.bias is not None).to(old_k.device, old_k.dtype)
+                new_attn.k_proj.weight.data.copy_(old_k)
+                
+            if hasattr(old_attn, "v_proj"):
+                old_v = old_attn.v_proj.weight.data
+                if new_attn.v_proj.weight.data.shape != old_v.shape:
+                    new_attn.v_proj = nn.Linear(old_v.shape[1], old_v.shape[0], bias=new_attn.v_proj.bias is not None).to(old_v.device, old_v.dtype)
+                new_attn.v_proj.weight.data.copy_(old_v)
+
+        # [SHAPE REPAIR]: Resize o_proj if input dimension doesn't match
+        old_o = old_attn.o_proj.weight.data
+        if new_attn.o_proj.weight.data.shape[1] != old_o.shape[1]:
+            print(f"Resizing new_attn.o_proj for layer {i} from {new_attn.o_proj.weight.data.shape} to {old_o.shape}")
+            new_attn.o_proj = nn.Linear(old_o.shape[1], old_o.shape[0], bias=new_attn.o_proj.bias is not None).to(old_o.device, old_o.dtype)
+            
+        new_attn.o_proj.weight.data.copy_(old_o)
         
         # --- Unfreeze New Components ---
         new_layer.self_attn.requires_grad_(True)
@@ -115,10 +170,10 @@ def perform_gdn_surgery(model):
         # --- In-Place Substitution & Memory Cleanup ---
         text_model.layers[i] = new_layer
         del old_layer
-        if i % 5 == 0: # Periodic aggressive cleanup to avoid slowing down too much
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+        # Aggressive cleanup for T4 DDP
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     # --- 3. Forward Pass Patching (Tunneling & Suppression) ---
     

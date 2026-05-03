@@ -202,11 +202,16 @@ def perform_gdn_surgery(model, target_layers=None):
                 layer_past = kwargs["past_key_values"][i]
 
             # Check if this is a hybrid layer (GemmaDeltaNetLayer) or original layer
+            # [REPAIR]: Prevent "multiple values for keyword argument" by cleaning kwargs
+            layer_kwargs = kwargs.copy()
+            layer_kwargs.pop("past_key_values", None)
+            layer_kwargs.pop("use_cache", None)
+
             layer_output = layer(
                 hidden_states,
                 per_layer_input=current_ple,
                 past_key_values=layer_past,
-                **kwargs
+                **layer_kwargs
             )
 
             # Handle both tuple returns (hybrid layers) and BaseModelOutputWithPast (original layers)
